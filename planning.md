@@ -84,29 +84,90 @@ A creator who disputes a classification can contest it, which flags the content 
 - very short text (under ~50 words): both signals get unreliable, so it defaults to uncertain
 
 ## Architecture
-Submission flow: raw text enters `POST /submit`, passes the prompt-injection filter, gets a genre from the classifier, then both signals score it in parallel. The scores go through agreement-gated scoring, the label generator turns the combined score into label text, the decision is written to the audit log, and the JSON response goes back to the caller. Appeal flow: `POST /appeal` looks up the content by id, sets its status to under_review, appends to the audit log, and returns a confirmation.
+Submission flow: raw text enters `POST /submit` with an optional `content_type`, passes the prompt-injection filter (which rejects text that reads as an instruction to the classifier), gets a genre from the classifier, then three signals score it (GROQ semantic, stylometric heuristics, and compression/predictability). The compression signal abstains on ordinary prose and only joins the vote when it detects real redundancy. The participating signals go through the weighted ensemble with a spread gate, the label generator turns the combined score into label text, the decision is written to the audit log, and the JSON response goes back to the caller (with a Verified Human badge if the creator holds a certificate). Appeal flow: `POST /appeal` looks up the content by id, sets its status to under_review, appends to the audit log, and returns a confirmation. Verification flow: `POST /verify` runs the same ensemble on a live writing sample and issues a certificate if it scores likely_human. Analytics: `GET /analytics` and `GET /dashboard` roll up the stored decisions.
 
 ```mermaid
+---
+config:
+  layout: elk
+---
 flowchart TD
-    subgraph Submission
-        C1([client]) -->|raw text + creator_id| S[POST /submit]
-        S -->|raw text| F[prompt-injection filter]
-        F -->|clean text| G[genre classifier]
-        G -->|text + genre| LLM[GROQ semantic signal]
-        G -->|text + genre| STY[stylometric signal]
-        LLM -->|llm_score| SC[agreement-gated scoring]
-        STY -->|stylo_score| SC
-        SC -->|combined score + band| L[label generator]
-        L -->|label text + confidence| AL1[(audit log)]
-        AL1 -->|attribution, confidence, label| R1([JSON response])
+    caller[Caller]
+    post["POST /submit<br/>(optional content_type)"]
+    filter["Prompt-Injection Filter<br/>(rejects text that reads as an instruction to the classifier)"]
+    classifier[Genre Classifier]
+    groq[GROQ Semantic Signal]
+    stylometric[Stylometric Heuristics Signal]
+    compression["Compression/Predictability Signal<br/>(abstains on ordinary prose,<br/>joins when redundancy detected)"]
+    ensemble["Weighted Ensemble<br/>with Spread Gate"]
+    labelGen[Label Generator]
+    auditLog[Audit Log]
+    response["JSON Response<br/>(adds Verified Human badge<br/>if certificate present)"]
+
+    caller -->|raw text| post
+    post --> filter
+    filter -->|passes| classifier
+    classifier -->|genre| groq
+    classifier --> stylometric
+    classifier --> compression
+    groq -->|score| ensemble
+    stylometric -->|score| ensemble
+    compression -->|conditional score| ensemble
+    ensemble -->|combined score| labelGen
+    labelGen -->|label text| auditLog
+    auditLog --> response
+    response -->|JSON| caller
+
+    classDef input stroke:#38bdf8,fill:#f0f9ff
+    classDef process stroke:#a78bfa,fill:#f5f3ff
+    classDef decision stroke:#facc15,fill:#fefce8
+    classDef output stroke:#4ade80,fill:#f0fdf4
+    class caller input
+    class post,filter,classifier,groq,stylometric,compression,ensemble,labelGen process
+    class auditLog,response output
+```
+
+``` mermaid
+---
+config:
+  layout: elk
+---
+flowchart TD
+    %% Appeal Flow
+    subgraph A["Appeal Flow — POST /appeal"]
+        U["User submits POST /appeal (content_id)"] --> G1["API Gateway looks up content by id"]
+        G1 --> S1["Content Service updates status → under_review"]
+        S1 --> L1["Audit Log appends entry"]
+        L1 --> U1["Return 200 OK (Appeal confirmed)"]
     end
 
-    subgraph Appeal
-        C2([client]) -->|content_id + creator_reasoning| A[POST /appeal]
-        A -->|content_id| LU[lookup content, set status = under_review]
-        LU -->|appeal + original decision| AL2[(audit log)]
-        AL2 -->|confirmation| R2(["JSON response<br/>Request under review..."])
+    classDef appeal stroke:#818cf8,fill:#eef2ff
+    class A,U,G1,S1,L1,U1 appeal
+
+    %% Verification Flow
+    subgraph V["Verification Flow — POST /verify"]
+        W["Writer submits POST /verify (writing sample)"] --> G2["API Gateway evaluates sample via Ensemble Model"]
+        G2 --> E["Ensemble Model returns score = likely_human / likely_ai"]
+        E --> C["Certificate Service issues certificate if likely_human"]
+        C --> W1["Return verification result (with certificate)"]
     end
+
+    classDef verify stroke:#2dd4bf,fill:#f0fdfa
+    class V,W,G2,E,C,W1 verify
+
+    %% Analytics Flow
+    subgraph N["Analytics — GET /analytics /dashboard"]
+        M["Moderator sends GET /analytics"] --> G3["API Gateway queries Analytics DB (summary)"]
+        G3 --> D1["Analytics DB returns aggregated results"]
+        D1 --> M1["Return JSON metrics"]
+        M1 --> M2["Moderator sends GET /dashboard"]
+        M2 --> G4["API Gateway queries Analytics DB (dashboard data)"]
+        G4 --> D2["Analytics DB returns visualization data"]
+        D2 --> M3["Return dashboard view"]
+    end
+
+    classDef analytics stroke:#fb923c,fill:#fff7ed
+    class N,M,G3,D1,M1,M2,G4,D2,M3 analytics
 ```
 
 ## AI Tools Plan
@@ -125,6 +186,20 @@ Adds a third, genuinely distinct signal and moves the pipeline from a 2-signal g
     - rationale: GROQ is heaviest because semantics is the hardest property to fake, stylometry is a solid but gameable middle, compression is the noisiest cue so it gets the least say
 - generalized agreement gate: if the spread (max P(AI) minus min P(AI) across the signals) is too wide, the signals disagree and the verdict is forced to uncertain. same intent as the old two-signal gap gate, extended to three.
 - bands and display confidence are unchanged (AI >= 0.70, human <= 0.40, verdict-matched confidence).
+
+### Analytics dashboard (HTML page + JSON API)
+Aggregates submission data into a live dashboard served two ways: a JSON endpoint for programmatic access and a server-rendered HTML page for the browser.
+- `GET /analytics` returns counts by attribution, genre, and content_type; appeal rate; average combined confidence; signal-agreement rate; and verified-creator submission count.
+- `GET /dashboard` renders the same numbers as a plain HTML page via `render_template_string`, no JavaScript required.
+- `get_analytics()` in `store.py` computes everything in a single database pass over the `content` and `audit_log` tables.
+
+### Provenance certificate (live writing challenge)
+A creator earns a "Verified Human" credential by completing a live writing challenge scored by the ensemble pipeline.
+- `GET /verify/challenge` returns a random writing prompt and a `challenge_id`.
+- `POST /verify` accepts `creator_id`, `challenge_id`, and the written `text`. The ensemble pipeline scores the passage; if it comes back `likely_human`, a `certificate_id` (uuid) is issued, the creator is marked verified in a new `creators` table, and the credential is returned. Otherwise a friendly failure message is returned.
+- `/submit` response gains `creator_verified` (bool) and a `badge` field when the submitting creator holds a certificate. `creator_verified` is stored on the content row.
+- `GET /creator/<creator_id>` returns credential status.
+- Verification attempts are logged to `audit_log` as `event='verify'`.
 
 ### Multi-modal support (image descriptions)
 Extends the pipeline to a second content type alongside plain text.

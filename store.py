@@ -78,6 +78,16 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creators (
+                creator_id     TEXT PRIMARY KEY,
+                verified       INTEGER DEFAULT 0,
+                certificate_id TEXT,
+                verified_at    TEXT
+            )
+            """
+        )
         _migrate(conn)
 
 
@@ -188,6 +198,52 @@ def get_content(content_id):
         return dict(row) if row else None
 
 
+def get_creator(creator_id):
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM creators WHERE creator_id = ?", (creator_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def set_verified(creator_id, certificate_id):
+    """Mark a creator as verified. Inserts the row if it doesn't exist yet."""
+    ts = now_iso()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO creators (creator_id, verified, certificate_id, verified_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(creator_id) DO UPDATE SET
+                verified = 1, certificate_id = excluded.certificate_id,
+                verified_at = excluded.verified_at
+            """,
+            (creator_id, certificate_id, ts),
+        )
+
+
+def log_verify(creator_id, attribution, confidence, passed):
+    """Append a 'verify' event to the audit log."""
+    ts = now_iso()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log (content_id, creator_id, timestamp, event,
+                                   attribution, confidence, status, details)
+            VALUES ('', :creator_id, :timestamp, 'verify',
+                    :attribution, :confidence, :status, :details)
+            """,
+            {
+                "creator_id": creator_id,
+                "timestamp": ts,
+                "attribution": attribution,
+                "confidence": confidence,
+                "status": "verified" if passed else "failed",
+                "details": json.dumps({"passed": passed}),
+            },
+        )
+
+
 def get_log(limit=50):
     """Return the most recent audit-log entries as a list of dicts."""
     with _connect() as conn:
@@ -195,3 +251,61 @@ def get_log(limit=50):
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_analytics():
+    """Compute summary statistics over all submissions."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM content").fetchone()[0]
+
+        by_attribution = {
+            r["attribution"]: r["cnt"]
+            for r in conn.execute(
+                "SELECT attribution, COUNT(*) AS cnt FROM content GROUP BY attribution"
+            ).fetchall()
+        }
+
+        by_genre = {
+            r["genre"]: r["cnt"]
+            for r in conn.execute(
+                "SELECT genre, COUNT(*) AS cnt FROM content GROUP BY genre"
+            ).fetchall()
+        }
+
+        by_content_type = {
+            r["content_type"]: r["cnt"]
+            for r in conn.execute(
+                "SELECT content_type, COUNT(*) AS cnt FROM content GROUP BY content_type"
+            ).fetchall()
+        }
+
+        appeals = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE event = 'appeal'"
+        ).fetchone()[0]
+
+        avg_confidence = conn.execute(
+            "SELECT AVG(confidence) FROM content"
+        ).fetchone()[0]
+
+        # signal-agreement rate: submissions that did NOT land uncertain due to spread
+        agreed = conn.execute(
+            "SELECT COUNT(*) FROM content WHERE attribution != 'uncertain'"
+        ).fetchone()[0]
+
+        verified_submissions = conn.execute(
+            "SELECT COUNT(*) FROM content WHERE creator_verified = 1"
+        ).fetchone()[0]
+
+    appeal_rate = round(appeals / total, 3) if total else 0.0
+    agreement_rate = round(agreed / total, 3) if total else 0.0
+
+    return {
+        "total_submissions": total,
+        "by_attribution": by_attribution,
+        "by_genre": by_genre,
+        "by_content_type": by_content_type,
+        "appeal_rate": appeal_rate,
+        "avg_confidence": round(avg_confidence, 3) if avg_confidence is not None else None,
+        "signal_agreement_rate": agreement_rate,
+        "verified_creator_submissions": verified_submissions,
+    }
