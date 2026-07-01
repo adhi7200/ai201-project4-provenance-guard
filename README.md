@@ -140,6 +140,33 @@ Every decision is written to a structured SQLite audit log (not print statements
 
 The appeal entry preserves the original decision (attribution, both signal scores) next to the creator's reasoning, which is what a human reviewer sees in the `/appeals` queue.
 
+## Stretch features
+
+### Ensemble detection (3 signals, weighted voting)
+
+The pipeline runs a third signal and combines all three with a documented weighted ensemble instead of a two-signal gate.
+
+- **Third signal, compression/predictability** (`compression_signal` in `signals.py`): the text is compressed with `zlib` and the ratio of compressed to raw size is taken. Redundant, low-entropy writing compresses smaller, which reads AI-like. It measures raw information redundancy, so it is genuinely distinct from the semantic and stylometric signals. Measuring real prose showed that ordinary AI and human text compress almost identically (both around 0.65), so this is a one-directional cue: strong redundancy votes AI, but ordinary compressibility is not evidence of a human. On short or ordinary text the signal abstains and is left out of the ensemble rather than diluting the other two.
+- **Weighted ensemble** (`scoring.py`): each participating signal reports P(AI) and the combined score is a weighted mean with `llm 0.5, stylo 0.3, compression 0.2`. GROQ is heaviest because semantics is the hardest property to fake, stylometry is a solid but gameable middle, and compression is the noisiest cue so it gets the least say. When a signal abstains, its weight is dropped and the rest are renormalized.
+- **Generalized agreement gate**: if the spread (max minus min P(AI) across the participating signals) exceeds 0.40, the signals disagree and the verdict is forced to `uncertain`. This is the two-signal gap gate extended to N signals. The asymmetric bands and verdict-matched confidence are unchanged.
+
+Verified live: ordinary AI prose classifies `likely_ai` (combined 0.745) and human prose `likely_human` (0.232) with compression abstaining in both, while a deliberately repetitive passage makes compression fire (0.891) and all three signals agree on `likely_ai` (0.88).
+
+### Multi-modal support (image descriptions)
+
+`/submit` accepts an optional `content_type` field: `"text"` (default) or `"image_description"` for image captions and alt-text.
+
+- **Groq signal** switches to a caption-aware system prompt when `content_type` is `"image_description"`, so the model judges specificity and naturalness of observation rather than argument progression, which is the wrong lens for a caption.
+- **Stylometric signal** uses a lower minimum-word threshold for captions (8 words vs 30 for prose) so a short caption can score rather than abstain by default.
+- `content_type` is stored on the content row and written to the audit log, and echoed in the `/submit` response, so the modality is visible throughout.
+
+Example caption submission:
+```bash
+curl -s -X POST http://127.0.0.1:5000/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text":"A golden retriever leaping through autumn leaves in a sun-dappled park","creator_id":"u1","content_type":"image_description"}'
+```
+
 ## Known limitations
 
 - **Lightly-edited AI output slips through as human.** In testing, an AI-drafted paragraph that a human lightly edited scored `llm=0.20, stylo=0.38 -> likely_human`. This is tied directly to the signals: once a human breaks the surface tells (em dashes, adds a typo, varies a sentence) the stylometric signal relaxes, and if the semantic flow reads natural the Groq signal relaxes too. When both signals genuinely relax, there is nothing left to catch. This is the honest failure mode of any detector and the reason the appeal path exists.

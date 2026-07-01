@@ -22,23 +22,40 @@ def _connect():
     return conn
 
 
+def _migrate(conn):
+    """Add columns introduced after the original schema, so an existing database
+    is upgraded in place rather than dropped. Each entry is (table, column, decl).
+    """
+    additions = [
+        ("content", "content_type", "TEXT DEFAULT 'text'"),
+        ("audit_log", "content_type", "TEXT"),
+        ("content", "creator_verified", "INTEGER DEFAULT 0"),
+    ]
+    for table, column, decl in additions:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db():
-    """Create tables if they do not exist. Safe to call on every startup."""
+    """Create tables if they do not exist, then migrate. Safe on every startup."""
     with _connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS content (
-                content_id  TEXT PRIMARY KEY,
-                creator_id  TEXT NOT NULL,
-                text        TEXT NOT NULL,
-                genre       TEXT,
-                attribution TEXT,
-                confidence  REAL,
-                llm_score   REAL,
-                stylo_score REAL,
-                label       TEXT,
-                status      TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                content_id       TEXT PRIMARY KEY,
+                creator_id       TEXT NOT NULL,
+                text             TEXT NOT NULL,
+                genre            TEXT,
+                attribution      TEXT,
+                confidence       REAL,
+                llm_score        REAL,
+                stylo_score      REAL,
+                label            TEXT,
+                status           TEXT NOT NULL,
+                content_type     TEXT DEFAULT 'text',
+                creator_verified INTEGER DEFAULT 0,
+                created_at       TEXT NOT NULL
             )
             """
         )
@@ -55,11 +72,13 @@ def init_db():
                 llm_score        REAL,
                 stylo_score      REAL,
                 status           TEXT,
+                content_type     TEXT,
                 appeal_reasoning TEXT,
                 details          TEXT
             )
             """
         )
+        _migrate(conn)
 
 
 def now_iso():
@@ -70,36 +89,43 @@ def record_submission(entry):
     """Persist a new classification: write the content row and a 'submit' audit event.
 
     entry is a dict with keys: content_id, creator_id, text, genre, attribution,
-    confidence, llm_score, stylo_score, label, status.
+    confidence, llm_score, stylo_score, label, status. Optional: content_type
+    (defaults to 'text'), creator_verified (defaults to 0).
     """
     ts = now_iso()
+    row = {"content_type": "text", "creator_verified": 0, **entry, "created_at": ts}
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO content (content_id, creator_id, text, genre, attribution,
-                                 confidence, llm_score, stylo_score, label, status, created_at)
+                                 confidence, llm_score, stylo_score, label, status,
+                                 content_type, creator_verified, created_at)
             VALUES (:content_id, :creator_id, :text, :genre, :attribution,
-                    :confidence, :llm_score, :stylo_score, :label, :status, :created_at)
+                    :confidence, :llm_score, :stylo_score, :label, :status,
+                    :content_type, :creator_verified, :created_at)
             """,
-            {**entry, "created_at": ts},
+            row,
         )
         conn.execute(
             """
             INSERT INTO audit_log (content_id, creator_id, timestamp, event, attribution,
-                                   confidence, llm_score, stylo_score, status, details)
+                                   confidence, llm_score, stylo_score, status,
+                                   content_type, details)
             VALUES (:content_id, :creator_id, :timestamp, 'submit', :attribution,
-                    :confidence, :llm_score, :stylo_score, :status, :details)
+                    :confidence, :llm_score, :stylo_score, :status,
+                    :content_type, :details)
             """,
             {
-                "content_id": entry["content_id"],
-                "creator_id": entry["creator_id"],
+                "content_id": row["content_id"],
+                "creator_id": row["creator_id"],
                 "timestamp": ts,
-                "attribution": entry["attribution"],
-                "confidence": entry["confidence"],
-                "llm_score": entry["llm_score"],
-                "stylo_score": entry["stylo_score"],
-                "status": entry["status"],
-                "details": json.dumps({"genre": entry["genre"], "label": entry["label"]}),
+                "attribution": row["attribution"],
+                "confidence": row["confidence"],
+                "llm_score": row["llm_score"],
+                "stylo_score": row["stylo_score"],
+                "status": row["status"],
+                "content_type": row["content_type"],
+                "details": json.dumps({"genre": row["genre"], "label": row["label"]}),
             },
         )
 

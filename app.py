@@ -18,7 +18,7 @@ from flask_limiter.util import get_remote_address
 import store
 from labels import make_label
 from scoring import score
-from signals import groq_signal, stylometric_signal
+from signals import compression_signal, groq_signal, stylometric_signal
 
 app = Flask(__name__)
 store.init_db()
@@ -39,6 +39,9 @@ def submit():
     body = request.get_json(silent=True) or {}
     text = (body.get("text") or "").strip()
     creator_id = (body.get("creator_id") or "").strip()
+    content_type = body.get("content_type", "text")
+    if content_type not in ("text", "image_description"):
+        content_type = "text"
 
     if not text or not creator_id:
         return jsonify({"error": "both 'text' and 'creator_id' are required"}), 400
@@ -46,16 +49,25 @@ def submit():
     content_id = str(uuid.uuid4())
 
     # Signal 1: GROQ semantic classification (also detects genre).
-    signal1 = groq_signal(text)
+    signal1 = groq_signal(text, content_type=content_type)
     llm_score = signal1["llm_score"]
     genre = signal1["genre"]
 
     # Signal 2: stylometric heuristics, calibrated by the detected genre.
-    signal2 = stylometric_signal(text, genre=genre)
+    signal2 = stylometric_signal(text, genre=genre, content_type=content_type)
     stylo_score = signal2["stylo_score"]
 
-    # Agreement-gated combination of both signals.
-    result = score(llm_score, stylo_score)
+    # Signal 3: compression / predictability. It abstains on ordinary prose and
+    # only joins the ensemble when it detects real redundancy.
+    signal3 = compression_signal(text)
+    compression_score = signal3["compression_score"]
+
+    signals = {"llm": llm_score, "stylo": stylo_score}
+    if signal3["informative"]:
+        signals["compression"] = compression_score
+
+    # Weighted ensemble with the generalized agreement gate.
+    result = score(signals)
     attribution = result["attribution"]
     confidence = result["display_confidence"]
     label = make_label(attribution, confidence)
@@ -71,6 +83,7 @@ def submit():
         "stylo_score": stylo_score,
         "label": label,
         "status": "classified",
+        "content_type": content_type,
     }
     store.record_submission(entry)
 
@@ -80,8 +93,10 @@ def submit():
             "attribution": attribution,
             "confidence": confidence,
             "genre": genre,
+            "content_type": content_type,
             "llm_score": llm_score,
             "stylo_score": stylo_score,
+            "compression_score": compression_score,
             "combined": result["combined"],
             "signals_agree": result["agree"],
             "rationale": signal1["rationale"],

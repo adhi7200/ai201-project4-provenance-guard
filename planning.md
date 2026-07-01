@@ -114,3 +114,21 @@ For each implementation milestone: which spec sections to hand the AI tool, what
 - M3 (submission endpoint + first signal): provide the Detection signals section + the architecture diagram. ask for the Flask app skeleton with the `POST /submit` stub, the GROQ signal function, the audit-log writer, and a `GET /log` endpoint. verify the signal function standalone on a few inputs, then curl `/submit` and inspect the JSON.
 - M4 (second signal + confidence scoring): provide Detection signals + Uncertainty representation + the diagram. ask for the stylometric signal function and the agreement-gated scoring logic. verify the 4 test inputs land in distinct bands, printing `llm_score` and `stylo_score` separately to catch a misbehaving signal.
 - M5 (production layer): provide Transparency label design + Appeals workflow + the diagram. ask for the label-generation function, the `POST /appeal` endpoint, and Flask-Limiter setup. verify all 3 labels are reachable, an appeal flips status to under_review, and a 12-request loop returns 429s after the limit.
+
+## Stretch Features
+
+### Ensemble detection (3rd signal + weighted voting)
+Adds a third, genuinely distinct signal and moves the pipeline from a 2-signal gate to a documented weighted ensemble.
+- 3rd signal, compression/predictability: `zlib`-compress the text and take the ratio of compressed to raw size. More predictable/repetitive writing compresses smaller, which reads AI-like. It measures raw information redundancy, so it is distinct from both the semantic signal and the stylometric heuristics. Measurement showed ordinary AI and human prose compress almost identically (~0.65), so this is a one-directional cue: strong redundancy votes AI, but ordinary compressibility is not evidence of a human. On short text or ordinary prose it abstains and is left out of the ensemble rather than diluting the other signals.
+- weighted ensemble: each signal reports P(AI), and the combined score is a weighted mean.
+    - weights: llm 0.5, stylo 0.3, compression 0.2
+    - rationale: GROQ is heaviest because semantics is the hardest property to fake, stylometry is a solid but gameable middle, compression is the noisiest cue so it gets the least say
+- generalized agreement gate: if the spread (max P(AI) minus min P(AI) across the signals) is too wide, the signals disagree and the verdict is forced to uncertain. same intent as the old two-signal gap gate, extended to three.
+- bands and display confidence are unchanged (AI >= 0.70, human <= 0.40, verdict-matched confidence).
+
+### Multi-modal support (image descriptions)
+Extends the pipeline to a second content type alongside plain text.
+- `/submit` takes an optional `content_type`, either `text` (default) or `image_description` (an image caption or alt-text).
+- the signals are made modality-aware: GROQ is told when the input is a caption so it judges natural flow appropriately, and the stylometric signal uses a caption-calibrated path with a lower minimum-word threshold, since captions are short by nature.
+- `content_type` is stored on the content row and in the audit log, and echoed back in the response, so the modality is visible everywhere.
+- schema note: the new `content_type` column is added through a small migration helper (PRAGMA table_info then ALTER TABLE ADD COLUMN) so the existing dev database is preserved rather than dropped.
