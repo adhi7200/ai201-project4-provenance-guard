@@ -8,10 +8,12 @@ Two tables:
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 
-DB_PATH = "provenance.db"
+# Overridable so tests can point at their own database (see tests/conftest.py).
+DB_PATH = os.environ.get("PROVENANCE_DB", "provenance.db")
 
 
 def _connect():
@@ -43,17 +45,18 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                content_id  TEXT NOT NULL,
-                creator_id  TEXT,
-                timestamp   TEXT NOT NULL,
-                event       TEXT NOT NULL,
-                attribution TEXT,
-                confidence  REAL,
-                llm_score   REAL,
-                stylo_score REAL,
-                status      TEXT,
-                details     TEXT
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_id       TEXT NOT NULL,
+                creator_id       TEXT,
+                timestamp        TEXT NOT NULL,
+                event            TEXT NOT NULL,
+                attribution      TEXT,
+                confidence       REAL,
+                llm_score        REAL,
+                stylo_score      REAL,
+                status           TEXT,
+                appeal_reasoning TEXT,
+                details          TEXT
             )
             """
         )
@@ -99,6 +102,56 @@ def record_submission(entry):
                 "details": json.dumps({"genre": entry["genre"], "label": entry["label"]}),
             },
         )
+
+
+def record_appeal(content_id, creator_reasoning):
+    """Log an appeal and flip the content's status to under_review.
+
+    Returns True if the content existed and was updated, False otherwise. The
+    appeal audit entry preserves the original decision (attribution, confidence,
+    both signal scores) so a reviewer sees it next to the creator's reasoning.
+    """
+    content = get_content(content_id)
+    if content is None:
+        return False
+
+    ts = now_iso()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE content SET status = 'under_review' WHERE content_id = ?",
+            (content_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (content_id, creator_id, timestamp, event, attribution,
+                                   confidence, llm_score, stylo_score, status,
+                                   appeal_reasoning, details)
+            VALUES (:content_id, :creator_id, :timestamp, 'appeal', :attribution,
+                    :confidence, :llm_score, :stylo_score, 'under_review',
+                    :appeal_reasoning, :details)
+            """,
+            {
+                "content_id": content_id,
+                "creator_id": content["creator_id"],
+                "timestamp": ts,
+                "attribution": content["attribution"],
+                "confidence": content["confidence"],
+                "llm_score": content["llm_score"],
+                "stylo_score": content["stylo_score"],
+                "appeal_reasoning": creator_reasoning,
+                "details": json.dumps({"original_status": content["status"]}),
+            },
+        )
+    return True
+
+
+def get_appeal_queue():
+    """Return all content currently awaiting human review (the reviewer's queue)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM content WHERE status = 'under_review' ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_content(content_id):

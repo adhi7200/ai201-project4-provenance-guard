@@ -9,6 +9,8 @@ Signal 2 (stylometric heuristics) arrives in Milestone 4.
 
 import json
 import os
+import re
+import statistics
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -74,8 +76,92 @@ def groq_signal(text):
         }
 
 
+# --------------------------------------------------------------------------- #
+# Signal 2: stylometric heuristics (pure Python, structure only)
+# --------------------------------------------------------------------------- #
+
+# Connective words/phrases that AI text leans on far more than human writing.
+_TRANSITIONS = {
+    "however", "moreover", "furthermore", "additionally", "therefore",
+    "consequently", "nevertheless", "nonetheless", "thus", "hence", "overall",
+    "indeed", "notably", "specifically", "ultimately", "essentially",
+}
+_TRANSITION_PHRASES = [
+    "it is important to note", "it's important to note", "plays a crucial role",
+    "in conclusion", "on the other hand", "as a result", "in today's world",
+    "when it comes to", "a wide range of",
+]
+
+# Short text below this word count makes every heuristic unreliable, so we
+# abstain to a neutral 0.5 (the pipeline then lands on uncertain).
+_MIN_WORDS = 30
+
+
+def _clamp(x):
+    return max(0.0, min(1.0, x))
+
+
+def _words(text):
+    return re.findall(r"[a-z']+", text.lower())
+
+
+def stylometric_signal(text, genre=None):
+    """Return a structure-only P(AI) for the text.
+
+    Returns {"stylo_score": float, "features": {name: sub_score}}. Each sub-score
+    is an AI-likelihood in [0, 1]; the overall stylo_score is their mean. genre is
+    accepted for future per-genre calibration; the base thresholds are used for now.
+    """
+    words = _words(text)
+    sentences = [s.strip() for s in re.split(r"[.!?\n]+", text) if s.strip()]
+    n_words = len(words)
+
+    if n_words < _MIN_WORDS:
+        return {"stylo_score": 0.5, "features": {"note": "text too short to score"}}
+
+    features = {}
+
+    # 1. Burstiness: humans vary sentence length a lot, AI clusters tightly.
+    #    Low coefficient of variation (std/mean) -> AI-like.
+    if len(sentences) >= 2:
+        lens = [len(_words(s)) for s in sentences]
+        mean_len = statistics.mean(lens)
+        cv = statistics.pstdev(lens) / mean_len if mean_len else 0.0
+        features["burstiness"] = _clamp(1.0 - cv / 0.7)
+
+    # 2. Sentence-opener diversity: repeated openers -> AI-like. Full diversity is
+    #    only weak human evidence (AI varies openers too), so it floors near neutral.
+    if len(sentences) >= 3:
+        openers = [(_words(s) or [""])[0] for s in sentences]
+        diversity = len(set(openers)) / len(openers)
+        features["opener_diversity"] = _clamp(0.9 - (diversity - 0.4) * 0.9)
+
+    # 3. Transition density: connective words/phrases per sentence -> AI-like.
+    low = text.lower()
+    trans = sum(1 for w in words if w in _TRANSITIONS)
+    trans += sum(low.count(p) for p in _TRANSITION_PHRASES)
+    density = trans / max(len(sentences), 1)
+    features["transition_density"] = _clamp(density / 0.5)
+
+    # 4. Punctuation polish: em dashes and smart quotes/ellipses -> AI-like. Their
+    #    absence is not evidence of a human (AI often omits them), so it sits at a
+    #    neutral baseline and only pushes upward when polish is present.
+    em = text.count("—")
+    smart = sum(text.count(c) for c in "“”‘’…")
+    features["punctuation"] = _clamp(0.45 + (em * 1000 / n_words) + (0.35 if smart else 0.0))
+
+    # 5. Informality: contractions and casual "i" -> human, so invert it.
+    contractions = sum(1 for w in words if "'" in w)
+    casual_i = len(re.findall(r"\bi\b", text))  # lowercase standalone "i"
+    informal_rate = (contractions + casual_i) / n_words
+    features["informality"] = _clamp(1.0 - informal_rate * 15)
+
+    stylo_score = statistics.mean(features.values())
+    return {"stylo_score": round(stylo_score, 3), "features": features}
+
+
 if __name__ == "__main__":
-    # Quick standalone test: call the signal directly and inspect its output.
+    # Quick standalone test: call both signals directly and inspect their output.
     samples = {
         "clearly_ai": (
             "Artificial intelligence represents a transformative paradigm shift in "
@@ -87,8 +173,10 @@ if __name__ == "__main__":
         "clearly_human": (
             "ok so i finally tried that new ramen place downtown and honestly? "
             "underwhelming. the broth was fine but they put WAY too much sodium in it "
-            "and i was thirsty for like three hours after."
+            "and i was thirsty for like three hours after. my friend got the spicy "
+            "version and said it was better."
         ),
     }
     for name, sample in samples.items():
-        print(name, "->", groq_signal(sample))
+        print(name, "-> groq:", groq_signal(sample))
+        print(name, "-> stylo:", stylometric_signal(sample))
