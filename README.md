@@ -311,4 +311,4 @@ The `content_type` is echoed in the response and the caption-aware Groq prompt d
 
 ## Portfolio walkthrough
 
-[Watch the walkthrough](https://www.loom.com/share/your-video-id)
+[Watch the walkthrough](https://www.loom.com/share/7e6bcafd93664df0bbb395bde459e677)
