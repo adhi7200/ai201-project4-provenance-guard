@@ -1,1 +1,5 @@
 .env
+.venv/
+provenance.db
+__pycache__/
+*.pyc
